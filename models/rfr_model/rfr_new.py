@@ -7,10 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .update import BasicUpdateBlock, SmallUpdateBlock
-from .extractor import BasicEncoder, SmallEncoder
-from .corr import CorrBlock
-from .utils import bilinear_sampler, coords_grid, upflow8
+from models.rfr_common.update import BasicUpdateBlock, SmallUpdateBlock
+from models.rfr_common.extractor import BasicEncoder, SmallEncoder
+from models.rfr_common.corr import CorrBlock
+from models.rfr_common.utils import bilinear_sampler, coords_grid, upflow8
 
 try:
     autocast = torch.cuda.amp.autocast
@@ -72,9 +72,10 @@ class RFR(nn.Module):
         args.dropout = 0
         self.args = args
 
+
         # feature network, context network, and update block
         self.fnet = BasicEncoder(output_dim=256, norm_fn='none', dropout=args.dropout)        
-        # self.cnet = BasicEncoder(output_dim=hdim+cdim, norm_fn='none', dropout=args.dropout)
+        self.cnet = BasicEncoder(output_dim=hdim+cdim, norm_fn='none', dropout=args.dropout)
         self.update_block = BasicUpdateBlock(self.args, hidden_dim=hdim)
         
         
@@ -123,38 +124,43 @@ class RFR(nn.Module):
                 
                 warp21 = backwarp(im28, flow_init_resize)
                 error21 = torch.sum(torch.abs(warp21 - im18), dim=1, keepdim=True)
-                # print('errormin', error21.min(), error21.max())
-                f12init = torch.exp(- self.attention2(torch.cat([im18, error21, flow_init_resize], dim=1)) ** 2) * flow_init_resize
+                print('errormin', error21.min(), error21.max())
+                f12_init = torch.exp(- self.attention2(torch.cat([im18, error21, flow_init_resize], dim=1)) ** 2) # flow_init_resize -> 이부분은 input이 따로 있을거 같다, 코드 다시 구현해보기 
         else:
             flow_init_resize = None
             flow_init = torch.zeros(image1.size()[0], 2, image1.size()[2]//8, image1.size()[3]//8).cuda()
             error21 = torch.zeros(image1.size()[0], 1, image1.size()[2]//8, image1.size()[3]//8).cuda()
 
             f12_init = flow_init
-            # print('None inital flow!')
+            print('None inital flow!')
         
-        image1 = F.interpolate(image1, size=(H8, W8), mode='bilinear')
-        image2 = F.interpolate(image2, size=(H8, W8), mode='bilinear')
+        flow_init_resize = None 
+        error21 = None
 
-        f12s, f12, f12_init = self.forward_pred(image1, image2, iters, flow_init_resize, upsample, test_mode)
-        
- 
-        if (hasattr(self.args, 'requires_sq_flow') and self.args.requires_sq_flow):
-            for ii in range(len(f12s)):
-                f12s[ii] = F.interpolate(f12s[ii], size=(H, W), mode='bilinear')
-                f12s[ii][:, :1] = f12s[ii][:, :1].clone() / (1.0*W8) * W
-                f12s[ii][:, 1:] = f12s[ii][:, 1:].clone() / (1.0*H8) * H
-            if self.training:
-                return f12s
+        image1 = F.interpolate(image1, size=(H8, W8), mode='bilinear') #H//64 size로 down sampling 
+        image2 = F.interpolate(image2, size=(H8, W8), mode='bilinear') #W//64 size로 down sampling 
+
+        if test_mode:
+            flow_low, flow_up = self.forward_pred(image1, image2, iters, flow_init_resize, upsample, test_mode)
+            return flow_low, flow_up
+        else: 
+            f12s, f12, f12_init = self.forward_pred(image1, image2, iters, flow_init_resize, upsample, test_mode) #flow_predictions, flow_up, flow_init
+            if (hasattr(self.args, 'requires_sq_flow') and self.args.requires_sq_flow):
+                for ii in range(len(f12s)):
+                    f12s[ii] = F.interpolate(f12s[ii], size=(H, W), mode='bilinear') ##기존 size로 upsampling
+                    f12s[ii][:, :1] = f12s[ii][:, :1].clone() / (1.0*W8) * W ##?
+                    f12s[ii][:, 1:] = f12s[ii][:, 1:].clone() / (1.0*H8) * H ##? 
+                if self.args.training:
+                    return f12s ##returns only flow predictions 
+                else:
+                    return [f12s[-1]], f12_init ##else: last index of flow prediction, initial flow 
             else:
-                return [f12s[-1]], f12_init
-        else:
-            f12[:, :1] = f12[:, :1].clone() / (1.0*W8) * W
-            f12[:, 1:] = f12[:, 1:].clone() / (1.0*H8) * H
+                f12[:, :1] = f12[:, :1].clone() / (1.0*W8) * W
+                f12[:, 1:] = f12[:, 1:].clone() / (1.0*H8) * H
 
-            f12 = F.interpolate(f12, size=(H, W), mode='bilinear')
-            # print('wo!!')
-            return f12, f12_init, error21, 
+                f12 = F.interpolate(f12, size=(H, W), mode='bilinear')
+                # print('wo!!')
+                return f12, f12_init, error21, 
             
     def forward_pred(self, image1, image2, iters=12, flow_init=None, upsample=True, test_mode=False):
         """ Estimate optical flow between pair of frames """
@@ -167,20 +173,20 @@ class RFR(nn.Module):
         cdim = self.context_dim
 
         # run the feature network
-        with autocast(enabled=self.args.mixed_precision):
-            fmap1, fmap2 = self.fnet([image1, image2])
+        with autocast():
+            fmap1, fmap2 = self.fnet([image1, image2]) 
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
         corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
 
         # run the context network
-        with autocast(enabled=self.args.mixed_precision):
-            cnet = self.fnet(image1)
+        with autocast():
+            cnet = self.cnet(image1) 
             net, inp = torch.split(cnet, [hdim, cdim], dim=1)
             net = torch.tanh(net)
             inp = torch.relu(inp)
 
-        coords0, coords1 = self.initialize_flow(image1)
+        coords0, coords1 = self.initialize_flow(image1) 
 
         if flow_init is not None:
             coords1 = coords1 + flow_init
@@ -195,7 +201,7 @@ class RFR(nn.Module):
 
             flow = coords1 - coords0
             with autocast(enabled=self.args.mixed_precision):
-                net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
+                net, up_mask, delta_flow = self.update_block(net, inp, corr, flow) #GRU part 
 
             # F(t+1) = F(t) + \Delta(t)
             coords1 = coords1 + delta_flow
@@ -207,6 +213,9 @@ class RFR(nn.Module):
                 flow_up = self.upsample_flow(coords1 - coords0, up_mask)
             
             flow_predictions.append(flow_up)
+
+        if test_mode:
+            return coords1 - coords0, flow_up
 
 
         return flow_predictions, flow_up, flow_init
