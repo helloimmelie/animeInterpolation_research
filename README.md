@@ -1,3 +1,9 @@
+This code is implemented below github repository: 
+(AnimeInterp) 
+Also below: 
+https://github.com/zacjiang/GMA (Learning to Estimate Hidden Motions with Global Motion Aggregation)
+https://github.com/abdo-eldesokey/RAFT-NCUP(Normalized Convolution Upsampling for Refined Optical Flow Estimation) 
+
 # AnimeInterp
 
 This is the code for paper "Deep Animation Video Interpolation in the Wild" (CVPR21). 
